@@ -54,10 +54,12 @@ class Policy:
 	payout_atto: u256
 	status: str
 	delay_minutes: u256
+	source_url: str
 
 
 class FlightDelayInsurer(gl.Contract):
 	owner_addr: Address
+	approved_sources: TreeMap[str, str]
 	policies: TreeMap[str, Policy]
 	credits: TreeMap[Address, u256]
 	policy_ids: DynArray[str]
@@ -71,9 +73,42 @@ class FlightDelayInsurer(gl.Contract):
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Unknown policy id")
 		return policy
 
+	def _source_is_approved(self, url: str) -> bool:
+		for prefix in self.approved_sources.keys():
+			if url.startswith(str(prefix)):
+				return True
+		return False
+
 	@gl.public.view
 	def owner(self) -> Address:
 		return self.owner_addr
+
+	@gl.public.write
+	def approve_source(self, url_prefix: str, name: str) -> None:
+		if gl.message.sender_address != self.owner_addr:
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Only owner may approve flight sources")
+		if not str(url_prefix).startswith("https://"):
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Source prefix must be an https URL")
+		self.approved_sources[str(url_prefix)] = str(name)
+
+	@gl.public.write
+	def revoke_source(self, url_prefix: str) -> None:
+		if gl.message.sender_address != self.owner_addr:
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Only owner may revoke flight sources")
+		if str(url_prefix) not in self.approved_sources:
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Source prefix is not approved")
+		del self.approved_sources[str(url_prefix)]
+
+	@gl.public.view
+	def get_approved_sources(self) -> dict:
+		prefixes = []
+		for prefix in self.approved_sources.keys():
+			prefixes.append(str(prefix))
+		return {"prefixes": prefixes}
+
+	@gl.public.view
+	def is_source_approved(self, url: str) -> bool:
+		return self._source_is_approved(str(url))
 
 	@gl.public.write.payable
 	def buy_policy(
@@ -82,6 +117,7 @@ class FlightDelayInsurer(gl.Contract):
 		flight: str,
 		date_iso: str,
 		threshold_minutes: u256,
+		source_url: str,
 	) -> None:
 		if gl.message.value == u256(0):
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Send value with the call")
@@ -89,6 +125,9 @@ class FlightDelayInsurer(gl.Contract):
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Threshold must be greater than zero")
 		if str(policy_id) in self.policies:
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Policy id already exists")
+		url = str(source_url)
+		if not self._source_is_approved(url):
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Flight data source is not owner-approved")
 		premium_atto = u256(gl.message.value)
 		payout_atto = u256(int(premium_atto) * PAYOUT_MULTIPLIER)
 		self.policies[str(policy_id)] = Policy(
@@ -100,15 +139,16 @@ class FlightDelayInsurer(gl.Contract):
 			payout_atto=payout_atto,
 			status=STATUS_ACTIVE,
 			delay_minutes=u256(0),
+			source_url=url,
 		)
 		self.policy_ids.append(str(policy_id))
 
 	@gl.public.write
-	def check_status(self, policy_id: str, source_url: str) -> None:
+	def check_status(self, policy_id: str) -> None:
 		policy = self._get_policy(policy_id)
 		if policy.status != STATUS_ACTIVE:
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Policy is not active")
-		url = str(source_url)
+		url = str(policy.source_url)
 		threshold = int(policy.threshold_minutes)
 
 		def leader_fn() -> dict:
@@ -184,6 +224,7 @@ class FlightDelayInsurer(gl.Contract):
 			"payout_atto": policy.payout_atto,
 			"status": policy.status,
 			"delay_minutes": policy.delay_minutes,
+			"source_url": policy.source_url,
 		}
 
 	@gl.public.view

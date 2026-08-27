@@ -8,10 +8,13 @@ FLIGHT_REGEX = r"flightdata\.example\.com"
 
 
 def _deploy(direct_vm, direct_deploy, owner):
-    """Deploys with `owner` as the sender so the deployer becomes the contract owner."""
+    """Deploys with `owner` as the sender; owner capitalizes the 10x payout reserve."""
     direct_vm.sender = owner
     contract = direct_deploy("contracts/FlightDelayInsurer.py")
     contract.approve_source("https://flightdata.example.com/", "Example Flight Data")
+    direct_vm.value = 500 * 10**18
+    contract.fund_reserve()
+    direct_vm.value = 0
     return contract
 
 
@@ -52,7 +55,7 @@ def test_check_status_pays_when_delay_meets_threshold(
 
     direct_vm.mock_web(
         FLIGHT_REGEX,
-        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 180})},
+        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 180, "flight": "AZ101", "date": "2026-08-01"})},
     )
 
     with direct_vm.prank(direct_bob):
@@ -74,7 +77,7 @@ def test_check_status_denies_when_flight_on_time(
 
     direct_vm.mock_web(
         FLIGHT_REGEX,
-        {"status": 200, "body": json.dumps({"status": "ON TIME", "delay_minutes": 30})},
+        {"status": 200, "body": json.dumps({"status": "ON TIME", "delay_minutes": 30, "flight": "AZ101", "date": "2026-08-01"})},
     )
     contract.check_status("policy-ontime")
 
@@ -93,7 +96,7 @@ def test_check_status_pays_on_cancelled_flight_with_zero_delay(
 
     direct_vm.mock_web(
         FLIGHT_REGEX,
-        {"status": 200, "body": json.dumps({"status": "CANCELLED", "delay_minutes": 0})},
+        {"status": 200, "body": json.dumps({"status": "CANCELLED", "delay_minutes": 0, "flight": "AZ101", "date": "2026-08-01"})},
     )
     contract.check_status("policy-cancelled")
 
@@ -112,7 +115,7 @@ def test_check_status_pays_at_exact_threshold_boundary(
 
     direct_vm.mock_web(
         FLIGHT_REGEX,
-        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 120})},
+        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 120, "flight": "AZ101", "date": "2026-08-01"})},
     )
     contract.check_status("policy-boundary")
 
@@ -167,7 +170,7 @@ def test_check_status_rejects_unknown_or_non_active_policy(
 
     direct_vm.mock_web(
         FLIGHT_REGEX,
-        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 180})},
+        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 180, "flight": "AZ101", "date": "2026-08-01"})},
     )
     contract.check_status("policy-live")
     assert contract.get_policy("policy-live")["status"] == "paid"
@@ -218,3 +221,48 @@ def test_source_registry_owner_only_and_views(direct_vm, direct_deploy, direct_a
     assert contract.is_source_approved("https://extra.example.com/a.json") is False
     with direct_vm.expect_revert("not approved"):
         contract.revoke_source("https://extra.example.com/")
+
+
+def test_payload_mismatch_reverts_as_expected(direct_vm, direct_deploy, direct_alice):
+    """A scoreboard for a different flight is arbitrary data — payout cannot trigger."""
+    contract = _deploy(direct_vm, direct_deploy, direct_alice)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 10**18
+    contract.buy_policy("p-mismatch", "AA999", "2026-09-01", 120, FLIGHT_URL)
+    direct_vm.value = 0
+
+    direct_vm.mock_web(
+        FLIGHT_REGEX,
+        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 200, "flight": "ZZ000", "date": "2026-09-01"})},
+    )
+    with direct_vm.expect_revert("Payload does not match this policy"):
+        contract.check_status("p-mismatch")
+    assert contract.get_policy("p-mismatch")["status"] == "active"
+
+
+def test_solvency_gates_new_policies(direct_vm, direct_deploy, direct_alice):
+    """Funding invariant: policies cannot be created beyond what the insurer's
+    premium pool + capital reserve can actually pay out."""
+    contract = _deploy(direct_vm, direct_deploy, direct_alice)
+    # _deploy seeds 500 GEN reserve — drain nothing, just outgrow it:
+    # after several purchases the committed exposure must block an oversized policy.
+    direct_vm.sender = direct_alice
+
+    import genlayer
+    bought = 0
+    for i in range(60):
+        pid = f"p-fill-{i}"
+        direct_vm.value = 10**18
+        try:
+            contract.buy_policy(pid, "AZ101", "2026-08-01", 120, FLIGHT_URL)
+            bought += 1
+        except genlayer.gl.vm.UserError as e:
+            assert "Insufficient insurer reserve" in str(getattr(e, 'message', e))
+            break
+        finally:
+            direct_vm.value = 0
+
+    assert bought >= 1
+    direct_vm.value = 10**18
+    with direct_vm.expect_revert("Insufficient insurer reserve"):
+        contract.buy_policy(f"p-final-x", "AZ101", "2026-08-01", 120, FLIGHT_URL)

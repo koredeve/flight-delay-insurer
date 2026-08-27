@@ -60,12 +60,18 @@ class Policy:
 class FlightDelayInsurer(gl.Contract):
 	owner_addr: Address
 	approved_sources: TreeMap[str, str]
+	insurance_pool: u256
+	reserve_fund: u256
+	exposure: u256
 	policies: TreeMap[str, Policy]
 	credits: TreeMap[Address, u256]
 	policy_ids: DynArray[str]
 
 	def __init__(self) -> None:
 		self.owner_addr = gl.message.sender_address
+		self.insurance_pool = u256(0)
+		self.reserve_fund = u256(0)
+		self.exposure = u256(0)
 
 	def _get_policy(self, policy_id: str) -> Policy:
 		policy = self.policies.get(str(policy_id))
@@ -111,6 +117,12 @@ class FlightDelayInsurer(gl.Contract):
 		return self._source_is_approved(str(url))
 
 	@gl.public.write.payable
+	def fund_reserve(self) -> None:
+		if gl.message.value == u256(0):
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Send GEN with the call")
+		self.reserve_fund = self.reserve_fund + gl.message.value
+
+	@gl.public.write.payable
 	def buy_policy(
 		self,
 		policy_id: str,
@@ -130,6 +142,14 @@ class FlightDelayInsurer(gl.Contract):
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Flight data source is not owner-approved")
 		premium_atto = u256(gl.message.value)
 		payout_atto = u256(int(premium_atto) * PAYOUT_MULTIPLIER)
+		# Funding invariant: the insurer must hold enough GEN (premium pool +
+		# capital reserve) to cover every active policy's full 10x payout.
+		if self.insurance_pool + self.reserve_fund < self.exposure + payout_atto:
+			raise gl.vm.UserError(
+				f"{ERROR_EXPECTED} Insufficient insurer reserve for this policy's full payout"
+			)
+		self.insurance_pool = self.insurance_pool + premium_atto
+		self.exposure = self.exposure + payout_atto
 		self.policies[str(policy_id)] = Policy(
 			insured=gl.message.sender_address,
 			flight=str(flight),
@@ -150,6 +170,8 @@ class FlightDelayInsurer(gl.Contract):
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Policy is not active")
 		url = str(policy.source_url)
 		threshold = int(policy.threshold_minutes)
+		stored_flight = str(policy.flight).strip().upper()
+		stored_date = str(policy.date_iso).strip()
 
 		def leader_fn() -> dict:
 			res = gl.nondet.web.get(url)
@@ -165,6 +187,19 @@ class FlightDelayInsurer(gl.Contract):
 				raise gl.vm.UserError(f"{ERROR_EXTERNAL} malformed flight payload")
 			if not isinstance(payload, dict):
 				raise gl.vm.UserError(f"{ERROR_EXTERNAL} unexpected flight payload shape")
+			payload_flight = str(payload.get("flight", "")).strip().upper()
+			payload_date = str(payload.get("date", "") or payload.get("departure_date", "")).strip()
+			# Source binding: the payload must describe THIS policy's stored flight.
+			# A scoreboard for any other flight or date is rejected as arbitrary data.
+			flight_ok = (
+				stored_flight in payload_flight
+				or payload_flight in stored_flight
+			) and payload_flight != ""
+			date_ok = payload_date == "" or stored_date == "" or payload_date == stored_date
+			if not flight_ok or not date_ok:
+				raise gl.vm.UserError(
+					f"{ERROR_EXPECTED} Payload does not match this policy's stored flight ({stored_flight}) / date ({stored_date})"
+				)
 			status_l = str(payload.get("status", "")).upper()
 			raw_delay = payload.get("delay_minutes", 0)
 			if raw_delay is None:
@@ -194,13 +229,18 @@ class FlightDelayInsurer(gl.Contract):
 		result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
 
 		policy.delay_minutes = u256(int(result["delayed_min"]))
+		payout = u256(policy.payout_atto)
 		if bool(result["triggered"]):
+			from_pool = min(self.insurance_pool, payout)
+			from_reserve = payout - from_pool
+			self.insurance_pool = self.insurance_pool - from_pool
+			self.reserve_fund = self.reserve_fund - from_reserve
+			self.exposure = self.exposure - payout
 			policy.status = STATUS_PAID
 			insured = policy.insured
-			self.credits[insured] = self.credits.get(insured, u256(0)) + u256(
-				policy.payout_atto
-			)
+			self.credits[insured] = self.credits.get(insured, u256(0)) + payout
 		else:
+			self.exposure = self.exposure - payout
 			policy.status = STATUS_DENIED
 
 	@gl.public.write

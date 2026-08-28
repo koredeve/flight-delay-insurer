@@ -4,9 +4,9 @@ Parametric flight-delay insurance on GenLayer. A traveler buys a policy by attac
 
 ## Architecture
 
-- **User action**: `buy_policy(policy_id, flight, date_iso, threshold_minutes)` with attached value (the premium). Payout is fixed at `premium x 10` (`PAYOUT_MULTIPLIER`).
-- **Evidence source**: any public flight-status endpoint returning JSON like `{"status": "DELAYED", "delay_minutes": 180}`. The URL is supplied per-check via `check_status(policy_id, source_url)`.
-- **Nondet call**: the leader runs `gl.nondet.web.get(source_url)`, maps HTTP 4xx to `[EXTERNAL]` and 5xx to `[TRANSIENT]`, parses the body defensively (tolerating missing/malformed `status` / `delay_minutes` fields), and computes `triggered = status.upper() in ("CANCELLED", "DIVERTED") or delay_minutes >= threshold`.
+- **User action**: `buy_policy(policy_id, flight, date_iso, threshold_minutes, source_url)` with attached value (the premium). Payout is fixed at `premium x 10` (`PAYOUT_MULTIPLIER`), bound to an owner-approved source prefix.
+- **Evidence source**: any approved flight-status endpoint returning JSON like `{"status": "DELAYED", "delay_minutes": 180, "flight": "AZ101", "date": "2026-08-01"}`. The policy binds this URL at creation; status checks are triggered via `check_status(policy_id)`.
+- **Nondet call**: the leader runs `gl.nondet.web.get(source_url)`, maps HTTP 4xx to `[EXTERNAL]` and 5xx to `[TRANSIENT]`, parses the body defensively, strictly validates that the response explicitly contains matching `flight` and `date` fields for the policy, and computes `triggered = status.upper() in ("CANCELLED", "DIVERTED") or delay_minutes >= threshold`.
 - **Equivalence principle**: custom validator reruns the leader fetch independently and agrees only if the **triggered boolean matches exactly AND the reported delays differ by at most ±10 minutes** (jitter tolerance for fast-moving feeds). Error paths follow the canonical `_handle_leader_error` rules.
 - **Settlement effect**: on trigger, the policy flips to `paid`, the observed delay is persisted, and `payout_atto` is added to the insured's credit balance (withdrawable via `withdraw()`); otherwise it flips to `denied`. Either way the check is final — re-checking a resolved policy reverts.
 - **Appeal path**: GenLayer Optimistic Democracy gives leader-proposes / validator-check / appeal window natively; no extra contract machinery is required.
@@ -30,8 +30,11 @@ pytest tests/direct/ -v
 | Method | Type | Notes |
 | --- | --- | --- |
 | `owner()` | view | Deployer address (stored as `owner_addr`). |
-| `buy_policy(policy_id, flight, date_iso, threshold_minutes)` | write, payable | Requires value > 0 and threshold > 0; ids unique; payout = premium × 10. |
-| `check_status(policy_id, source_url)` | write | Active policies only; fetches live data, settles paid/denied, persists delay. |
+| `approve_source(url_prefix, name)` | write | Owner-only; registers an approved HTTPS flight data prefix. |
+| `revoke_source(url_prefix)` | write | Owner-only; removes an approved prefix. |
+| `fund_reserve()` | write, payable | Capitalizes the insurer's reserve fund to back policy payouts. |
+| `buy_policy(policy_id, flight, date_iso, threshold_minutes, source_url)` | write, payable | Requires value > 0, non-empty flight/date, approved source, and full insurer solvency reserve; payout = premium × 10. |
+| `check_status(policy_id)` | write | Active policies only; fetches live data, verifies flight/date identity match, settles paid/denied, persists delay. |
 | `withdraw()` | write | Transfers accumulated credits to caller; reverts with nothing owed. |
 | `get_policy(policy_id)` | view | Full policy record; `insured` exposed as string. |
 | `credit_of(who)` | view | Withdrawable balance for an address. |

@@ -266,3 +266,48 @@ def test_solvency_gates_new_policies(direct_vm, direct_deploy, direct_alice):
     direct_vm.value = 10**18
     with direct_vm.expect_revert("Insufficient insurer reserve"):
         contract.buy_policy(f"p-final-x", "AZ101", "2026-08-01", 120, FLIGHT_URL)
+
+
+def test_empty_flight_or_date_rejected_at_purchase(direct_vm, direct_deploy, direct_alice):
+    """Buying a policy with whitespace or empty flight/date is rejected."""
+    contract = _deploy(direct_vm, direct_deploy, direct_alice)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 10**18
+
+    with direct_vm.expect_revert("Flight identifier cannot be empty"):
+        contract.buy_policy("p-empty-flight", "   ", "2026-08-01", 120, FLIGHT_URL)
+
+    with direct_vm.expect_revert("Departure date cannot be empty"):
+        contract.buy_policy("p-empty-date", "AZ101", "  ", 120, FLIGHT_URL)
+
+
+def test_payload_missing_date_or_flight_rejected(direct_vm, direct_deploy, direct_alice):
+    """Payloads lacking an explicit date or flight cannot trigger settlement."""
+    contract = _deploy(direct_vm, direct_deploy, direct_alice)
+    _buy_policy(direct_vm, contract, direct_alice, "p-nodate")
+
+    # API returns status and delay, but completely omits date
+    direct_vm.mock_web(
+        FLIGHT_REGEX,
+        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 200, "flight": "AZ101"})},
+    )
+    with direct_vm.expect_revert("Flight status payload missing flight"):
+        contract.check_status("p-nodate")
+
+    assert contract.get_policy("p-nodate")["status"] == "active"
+
+
+def test_payload_date_mismatch_rejected(direct_vm, direct_deploy, direct_alice):
+    """A response for the right flight but wrong departure date is rejected."""
+    contract = _deploy(direct_vm, direct_deploy, direct_alice)
+    _buy_policy(direct_vm, contract, direct_alice, "p-wrongdate")
+
+    direct_vm.mock_web(
+        FLIGHT_REGEX,
+        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 200, "flight": "AZ101", "date": "2026-08-02"})},
+    )
+    with direct_vm.expect_revert("Payload does not match this policy"):
+        contract.check_status("p-wrongdate")
+
+    assert contract.get_policy("p-wrongdate")["status"] == "active"
+

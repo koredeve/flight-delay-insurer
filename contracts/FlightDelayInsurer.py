@@ -140,6 +140,12 @@ class FlightDelayInsurer(gl.Contract):
 		url = str(source_url)
 		if not self._source_is_approved(url):
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Flight data source is not owner-approved")
+		clean_flight = str(flight).strip().upper()
+		clean_date = str(date_iso).strip()
+		if not clean_flight:
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Flight identifier cannot be empty")
+		if not clean_date:
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Departure date cannot be empty")
 		premium_atto = u256(gl.message.value)
 		payout_atto = u256(int(premium_atto) * PAYOUT_MULTIPLIER)
 		# Funding invariant: the insurer must hold enough GEN (premium pool +
@@ -152,8 +158,8 @@ class FlightDelayInsurer(gl.Contract):
 		self.exposure = self.exposure + payout_atto
 		self.policies[str(policy_id)] = Policy(
 			insured=gl.message.sender_address,
-			flight=str(flight),
-			date_iso=str(date_iso),
+			flight=clean_flight,
+			date_iso=clean_date,
 			threshold_minutes=u256(threshold_minutes),
 			premium_atto=premium_atto,
 			payout_atto=payout_atto,
@@ -172,6 +178,8 @@ class FlightDelayInsurer(gl.Contract):
 		threshold = int(policy.threshold_minutes)
 		stored_flight = str(policy.flight).strip().upper()
 		stored_date = str(policy.date_iso).strip()
+		if not stored_flight or not stored_date:
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Policy flight and date must not be empty")
 
 		def leader_fn() -> dict:
 			res = gl.nondet.web.get(url)
@@ -189,13 +197,17 @@ class FlightDelayInsurer(gl.Contract):
 				raise gl.vm.UserError(f"{ERROR_EXTERNAL} unexpected flight payload shape")
 			payload_flight = str(payload.get("flight", "")).strip().upper()
 			payload_date = str(payload.get("date", "") or payload.get("departure_date", "")).strip()
-			# Source binding: the payload must describe THIS policy's stored flight.
-			# A scoreboard for any other flight or date is rejected as arbitrary data.
+			# Strict source binding: payload must explicitly contain matching non-empty flight and date.
+			# Responses missing flight or date cannot verify the policy's stored flight and date.
+			if not payload_flight or not payload_date:
+				raise gl.vm.UserError(
+					f"{ERROR_EXPECTED} Flight status payload missing flight ({payload_flight}) or date ({payload_date})"
+				)
 			flight_ok = (
 				stored_flight in payload_flight
 				or payload_flight in stored_flight
-			) and payload_flight != ""
-			date_ok = payload_date == "" or stored_date == "" or payload_date == stored_date
+			)
+			date_ok = (stored_date == payload_date) or (stored_date in payload_date) or (payload_date in stored_date)
 			if not flight_ok or not date_ok:
 				raise gl.vm.UserError(
 					f"{ERROR_EXPECTED} Payload does not match this policy's stored flight ({stored_flight}) / date ({stored_date})"

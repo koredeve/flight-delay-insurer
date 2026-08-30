@@ -15,6 +15,7 @@ STATUS_DENIED = "denied"
 
 PAYOUT_MULTIPLIER = 10
 TRIGGER_STATUSES = ("CANCELLED", "DIVERTED")
+FINAL_FLIGHT_STATUSES = ("LANDED", "ARRIVED", "COMPLETED", "CANCELLED", "DIVERTED")
 DELAY_TOLERANCE_MINUTES = 10
 
 
@@ -203,16 +204,24 @@ class FlightDelayInsurer(gl.Contract):
 				raise gl.vm.UserError(
 					f"{ERROR_EXPECTED} Flight status payload missing flight ({payload_flight}) or date ({payload_date})"
 				)
-			flight_ok = (
-				stored_flight in payload_flight
-				or payload_flight in stored_flight
-			)
-			date_ok = (stored_date == payload_date) or (stored_date in payload_date) or (payload_date in stored_date)
-			if not flight_ok or not date_ok:
+			# Canonical exact matching — no substring/partial matches allowed.
+			if payload_flight != stored_flight:
 				raise gl.vm.UserError(
-					f"{ERROR_EXPECTED} Payload does not match this policy's stored flight ({stored_flight}) / date ({stored_date})"
+					f"{ERROR_EXPECTED} Payload flight ({payload_flight}) does not match policy flight ({stored_flight})"
+				)
+			if payload_date != stored_date:
+				raise gl.vm.UserError(
+					f"{ERROR_EXPECTED} Payload date ({payload_date}) does not match policy date ({stored_date})"
 				)
 			status_l = str(payload.get("status", "")).upper()
+			# The flight must have reached a final, eligible resolution point
+			# before the policy can be permanently settled. If the flight is
+			# still in progress (e.g. SCHEDULED, BOARDING, IN_AIR), raise
+			# TRANSIENT so the check can be retried after arrival.
+			if status_l not in FINAL_FLIGHT_STATUSES:
+				raise gl.vm.UserError(
+					f"{ERROR_TRANSIENT} Flight has not reached a final resolution status ({status_l})"
+				)
 			raw_delay = payload.get("delay_minutes", 0)
 			if raw_delay is None:
 				raw_delay = 0

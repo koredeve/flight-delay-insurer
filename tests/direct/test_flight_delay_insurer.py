@@ -55,7 +55,7 @@ def test_check_status_pays_when_delay_meets_threshold(
 
     direct_vm.mock_web(
         FLIGHT_REGEX,
-        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 180, "flight": "AZ101", "date": "2026-08-01"})},
+        {"status": 200, "body": json.dumps({"status": "LANDED", "delay_minutes": 180, "flight": "AZ101", "date": "2026-08-01"})},
     )
 
     with direct_vm.prank(direct_bob):
@@ -77,7 +77,7 @@ def test_check_status_denies_when_flight_on_time(
 
     direct_vm.mock_web(
         FLIGHT_REGEX,
-        {"status": 200, "body": json.dumps({"status": "ON TIME", "delay_minutes": 30, "flight": "AZ101", "date": "2026-08-01"})},
+        {"status": 200, "body": json.dumps({"status": "LANDED", "delay_minutes": 30, "flight": "AZ101", "date": "2026-08-01"})},
     )
     contract.check_status("policy-ontime")
 
@@ -115,7 +115,7 @@ def test_check_status_pays_at_exact_threshold_boundary(
 
     direct_vm.mock_web(
         FLIGHT_REGEX,
-        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 120, "flight": "AZ101", "date": "2026-08-01"})},
+        {"status": 200, "body": json.dumps({"status": "LANDED", "delay_minutes": 120, "flight": "AZ101", "date": "2026-08-01"})},
     )
     contract.check_status("policy-boundary")
 
@@ -170,7 +170,7 @@ def test_check_status_rejects_unknown_or_non_active_policy(
 
     direct_vm.mock_web(
         FLIGHT_REGEX,
-        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 180, "flight": "AZ101", "date": "2026-08-01"})},
+        {"status": 200, "body": json.dumps({"status": "LANDED", "delay_minutes": 180, "flight": "AZ101", "date": "2026-08-01"})},
     )
     contract.check_status("policy-live")
     assert contract.get_policy("policy-live")["status"] == "paid"
@@ -233,9 +233,9 @@ def test_payload_mismatch_reverts_as_expected(direct_vm, direct_deploy, direct_a
 
     direct_vm.mock_web(
         FLIGHT_REGEX,
-        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 200, "flight": "ZZ000", "date": "2026-09-01"})},
+        {"status": 200, "body": json.dumps({"status": "LANDED", "delay_minutes": 200, "flight": "ZZ000", "date": "2026-09-01"})},
     )
-    with direct_vm.expect_revert("Payload does not match this policy"):
+    with direct_vm.expect_revert("Payload flight"):
         contract.check_status("p-mismatch")
     assert contract.get_policy("p-mismatch")["status"] == "active"
 
@@ -304,10 +304,55 @@ def test_payload_date_mismatch_rejected(direct_vm, direct_deploy, direct_alice):
 
     direct_vm.mock_web(
         FLIGHT_REGEX,
-        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 200, "flight": "AZ101", "date": "2026-08-02"})},
+        {"status": 200, "body": json.dumps({"status": "LANDED", "delay_minutes": 200, "flight": "AZ101", "date": "2026-08-02"})},
     )
-    with direct_vm.expect_revert("Payload does not match this policy"):
+    with direct_vm.expect_revert("Payload date"):
         contract.check_status("p-wrongdate")
 
     assert contract.get_policy("p-wrongdate")["status"] == "active"
 
+
+def test_premature_denial_prevented(direct_vm, direct_deploy, direct_alice):
+    """A non-final flight status (SCHEDULED) raises TRANSIENT and leaves the policy active."""
+    contract = _deploy(direct_vm, direct_deploy, direct_alice)
+    _buy_policy(direct_vm, contract, direct_alice, "p-premature")
+
+    # Flight is SCHEDULED — not final yet
+    direct_vm.mock_web(
+        FLIGHT_REGEX,
+        {"status": 200, "body": json.dumps({"status": "SCHEDULED", "delay_minutes": 0, "flight": "AZ101", "date": "2026-08-01"})},
+    )
+    with direct_vm.expect_revert("[TRANSIENT]"):
+        contract.check_status("p-premature")
+
+    # Policy remains active — not permanently denied
+    assert contract.get_policy("p-premature")["status"] == "active"
+
+
+def test_inflight_delayed_status_not_final(direct_vm, direct_deploy, direct_alice):
+    """A DELAYED status (in-progress) also raises TRANSIENT — cannot permanently settle."""
+    contract = _deploy(direct_vm, direct_deploy, direct_alice)
+    _buy_policy(direct_vm, contract, direct_alice, "p-inflight")
+
+    direct_vm.mock_web(
+        FLIGHT_REGEX,
+        {"status": 200, "body": json.dumps({"status": "DELAYED", "delay_minutes": 200, "flight": "AZ101", "date": "2026-08-01"})},
+    )
+    with direct_vm.expect_revert("[TRANSIENT]"):
+        contract.check_status("p-inflight")
+
+    assert contract.get_policy("p-inflight")["status"] == "active"
+
+
+def test_substring_flight_match_rejected(direct_vm, direct_deploy, direct_alice):
+    """Exact flight matching: 'AZ10' must NOT match stored 'AZ101' (no substring)."""
+    contract = _deploy(direct_vm, direct_deploy, direct_alice)
+    _buy_policy(direct_vm, contract, direct_alice, "p-substr")
+
+    direct_vm.mock_web(
+        FLIGHT_REGEX,
+        {"status": 200, "body": json.dumps({"status": "LANDED", "delay_minutes": 200, "flight": "AZ10", "date": "2026-08-01"})},
+    )
+    with direct_vm.expect_revert("Payload flight"):
+        contract.check_status("p-substr")
+    assert contract.get_policy("p-substr")["status"] == "active"
